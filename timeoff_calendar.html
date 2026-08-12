@@ -258,6 +258,7 @@
   </div>
   <div class="filter-row">
     <select id="empFilter" onchange="render()"><option value="">All Employees</option></select>
+    <select id="empIdFilter" onchange="render()"><option value="">All Employee IDs</option></select>
     <select id="typeFilter" onchange="render()">
       <option value="">All Types</option>
       <option value="vacation">Vacation</option>
@@ -346,6 +347,7 @@ function loadLiveStatuses(afterAction) {
         if (!id || !date) return;
 
         const key = id + '|' + date;
+        const empId = String(req.employeeId || '').trim();
 
         let status = 'pending';
         if ((req.rejectionStatus || '').toLowerCase() === 'rejected') status = 'rejected';
@@ -358,23 +360,27 @@ function loadLiveStatuses(afterAction) {
           localStatus[key] = status;
         }
 
-        // Always patch hours on existing RAW records when live has a real value
-        // Try every field name the GAS might use
-        const liveHours = parseFloat(
-          req.totalHours || req.requestedHours || req.hoursRequested || req.hours ||
-          req.shiftHours || req.numHours || 0
-        );
-        const liveApproved = parseFloat(req.approvedHours || req.hoursApproved || 0);
-        if (!isNaN(liveHours) && liveHours > 0) {
-          const existing = RAW.find(r => r.id === id && r.date === date);
-          if (existing && (existing.hours === 0 || existing.hours == null)) {
+        const existing = RAW.find(r => r.id === id && r.date === date);
+        if (existing) {
+          // Patch employee ID onto pre-embedded seed records so the ID filter
+          // (and name canonicalization) works for them too.
+          if (empId && !existing.employeeId) existing.employeeId = empId;
+
+          // Always patch hours on existing RAW records when live has a real value
+          // Try every field name the GAS might use
+          const liveHours = parseFloat(
+            req.totalHours || req.requestedHours || req.hoursRequested || req.hours ||
+            req.shiftHours || req.numHours || 0
+          );
+          if (!isNaN(liveHours) && liveHours > 0 && (existing.hours === 0 || existing.hours == null)) {
             existing.hours = liveHours;
           }
-        }
-        // Always store approvedHours on existing records so modal can show it
-        if (!isNaN(liveApproved) && liveApproved > 0) {
-          const existing = RAW.find(r => r.id === id && r.date === date);
-          if (existing) existing.approvedHours = liveApproved;
+
+          // Always store approvedHours on existing records so modal can show it
+          const liveApproved = parseFloat(req.approvedHours || req.hoursApproved || 0);
+          if (!isNaN(liveApproved) && liveApproved > 0) {
+            existing.approvedHours = liveApproved;
+          }
         }
       });
 
@@ -394,7 +400,11 @@ function loadLiveStatuses(afterAction) {
         // Map GAS field names to the RAW shape used by the calendar.
         // Try several common field-name patterns so this works regardless
         // of minor naming differences in the Apps Script response.
-        const name  = req.employeeName || req.name || req.employee || '';
+        // IMPORTANT: combine first + last name — using employeeName alone
+        // drops the last name and is why some employees showed up under a
+        // first-name-only entry in the filter dropdown.
+        const name = [req.employeeName, req.employeeLastName].filter(Boolean).join(' ').trim()
+          || req.name || req.employee || '';
         const rawType = (req.requestType || req.leaveType || req.type || 'vacation').toLowerCase();
         const type  = (rawType === 'sick' || rawType === 'sick leave') ? 'sick' : 'vacation';
         const hours = parseFloat(
@@ -402,6 +412,7 @@ function loadLiveStatuses(afterAction) {
           req.shiftHours || req.numHours || 0
         );
         const approvedHrs = parseFloat(req.approvedHours || req.hoursApproved || 0);
+        const empId = String(req.employeeId || '').trim();
 
         if (!name) return; // cannot render a chip without a name
 
@@ -411,6 +422,7 @@ function loadLiveStatuses(afterAction) {
         RAW.push({
           id,
           name,
+          employeeId: empId,
           type,
           date,
           hours: isNaN(hours) ? 0 : hours,
@@ -421,19 +433,6 @@ function loadLiveStatuses(afterAction) {
         existingKeys.add(key);
         newCount++;
       });
-
-      if (newCount > 0) {
-        // Re-populate the employee filter dropdown with any new names.
-        const empSel = document.getElementById('empFilter');
-        const existing = new Set([...empSel.options].map(o => o.value).filter(Boolean));
-        [...new Set(RAW.map(e => e.name))].sort().forEach(n => {
-          if (!existing.has(n)) {
-            const o = document.createElement('option');
-            o.value = n; o.textContent = n;
-            empSel.appendChild(o);
-          }
-        });
-      }
 
       // ---- REMOVE DELETED RECORDS ----
       // The sheet is the source of truth. Any RAW record whose id+date key
@@ -451,6 +450,11 @@ function loadLiveStatuses(afterAction) {
         const removedCount = beforeCount - RAW.length;
         if (removedCount > 0) console.log('[TimeOff Calendar] Removed', removedCount, 'deleted record(s) from RAW.');
       }
+
+      // Rebuild the Employee Name + Employee ID dropdowns from scratch, and
+      // canonicalize names per employee ID (fixes name variants like
+      // "Lucia Diaz" vs "Lucia Diaz Solis" showing up as separate people).
+      refreshEmployeeFilters();
 
       liveLoaded = true;
       if (indicator) {
@@ -475,12 +479,59 @@ let view = 'month';
 let cursor = new Date(today);
 const expandedCells = new Set(); // tracks which date strings are expanded in month view
 
-// ---- EMPLOYEE FILTER ----
-(function() {
-  const names = [...new Set(RAW.map(e=>e.name))].sort();
-  const sel = document.getElementById('empFilter');
-  names.forEach(n => { const o = document.createElement('option'); o.value=n; o.textContent=n; sel.appendChild(o); });
-})();
+// ---- EMPLOYEE FILTERS (Name + ID) ----
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Groups RAW records by employeeId, picks one canonical display name per ID
+// (the most frequently used spelling; ties broken by the longer/more complete
+// name), rewrites every record's name to match, then rebuilds both the
+// "All Employees" and "All Employee IDs" dropdowns so each employee appears
+// exactly once no matter how many name variants they were submitted under.
+function refreshEmployeeFilters() {
+  const idNameCounts = {}; // employeeId -> { name: occurrences }
+  RAW.forEach(r => {
+    if (!r.employeeId) return;
+    idNameCounts[r.employeeId] = idNameCounts[r.employeeId] || {};
+    idNameCounts[r.employeeId][r.name] = (idNameCounts[r.employeeId][r.name] || 0) + 1;
+  });
+
+  const idToCanonical = {};
+  Object.keys(idNameCounts).forEach(empId => {
+    const counts = idNameCounts[empId];
+    let best = null;
+    Object.keys(counts).forEach(name => {
+      if (!best) { best = name; return; }
+      if (counts[name] > counts[best] || (counts[name] === counts[best] && name.length > best.length)) {
+        best = name;
+      }
+    });
+    idToCanonical[empId] = best;
+  });
+
+  RAW.forEach(r => {
+    if (r.employeeId && idToCanonical[r.employeeId]) r.name = idToCanonical[r.employeeId];
+  });
+
+  // Rebuild Name dropdown (deduped, alphabetical), preserving current selection.
+  const empSel = document.getElementById('empFilter');
+  const prevEmp = empSel.value;
+  const names = [...new Set(RAW.map(r => r.name))].filter(Boolean).sort();
+  empSel.innerHTML = '<option value="">All Employees</option>' +
+    names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
+  if (names.includes(prevEmp)) empSel.value = prevEmp;
+
+  // Rebuild Employee ID dropdown (deduped, sorted by canonical name), preserving selection.
+  const idSel = document.getElementById('empIdFilter');
+  const prevId = idSel.value;
+  const ids = Object.keys(idToCanonical).sort((a,b) => idToCanonical[a].localeCompare(idToCanonical[b]));
+  idSel.innerHTML = '<option value="">All Employee IDs</option>' +
+    ids.map(id => `<option value="${escapeHtml(id)}">${escapeHtml(id)} — ${escapeHtml(idToCanonical[id])}</option>`).join('');
+  if (ids.includes(prevId)) idSel.value = prevId;
+}
+
+refreshEmployeeFilters(); // initial paint from embedded seed data
 
 // ---- HELPERS ----
 // For Sun-Sat display weeks: use Thursday (+4 days from Sunday) to identify
@@ -524,11 +575,12 @@ function getStatus(ev) {
 
 function filtered() {
   const emp = document.getElementById('empFilter').value;
+  const empId = document.getElementById('empIdFilter').value;
   const type = document.getElementById('typeFilter').value;
   const stat = document.getElementById('statusFilter').value;
   return RAW.filter(e => {
     const st = getStatus(e);
-    return (!emp||e.name===emp) && (!type||e.type===type) && (!stat||st===stat);
+    return (!emp||e.name===emp) && (!empId||String(e.employeeId||'')===empId) && (!type||e.type===type) && (!stat||st===stat);
   });
 }
 
@@ -857,6 +909,10 @@ function showModal(id, date) {
       <div class="modal-label">Request ID</div>
       <div class="modal-value" style="font-size:11px;color:var(--muted);font-family:monospace;">${ev.id}</div>
     </div>
+    ${ev.employeeId ? `<div class="modal-field">
+      <div class="modal-label">Employee ID</div>
+      <div class="modal-value" style="font-size:11px;color:var(--muted);font-family:monospace;">${ev.employeeId}</div>
+    </div>` : ''}
     ${actionZone}`;
 
   document.getElementById('modalOverlay').classList.add('open');
